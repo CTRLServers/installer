@@ -88,13 +88,22 @@ async fn get_latest_release() -> Result<LatestRelease, String> {
 
 #[tauri::command]
 async fn get_default_install_path() -> Result<String, String> {
-    let base = std::env::var("LOCALAPPDATA")
-        .map_err(|_| "Could not resolve the local AppData folder".to_string())?;
-    Ok(std::path::Path::new(&base)
-        .join("Programs")
-        .join("CTRLServers")
-        .to_string_lossy()
-        .into_owned())
+    let path = match std::env::consts::OS {
+        "windows" => {
+            let base = std::env::var("LOCALAPPDATA")
+                .map_err(|_| "Could not resolve the local AppData folder".to_string())?;
+            std::path::Path::new(&base)
+                .join("Programs")
+                .join("CTRLServers")
+        }
+        "macos" => dirs::home_dir()
+            .ok_or_else(|| "Could not resolve the home folder".to_string())?
+            .join("Applications"),
+        _ => dirs::data_dir()
+            .ok_or_else(|| "Could not resolve the data folder".to_string())?
+            .join("CTRLServers"),
+    };
+    Ok(path.to_string_lossy().into_owned())
 }
 
 async fn download_single(
@@ -237,7 +246,6 @@ async fn install_app(
         .await
         .map_err(|e| format!("Failed to create install folder: {e}"))?;
 
-    let dest = dir.join(&asset_name);
     let tmp = dir.join(format!("{asset_name}.download"));
 
     let client = http_client()?;
@@ -360,11 +368,124 @@ async fn install_app(
 
     result?;
 
-    tokio::fs::rename(&tmp, &dest)
-        .await
-        .map_err(|e| format!("Failed to move {asset_name} into place: {e}"))?;
+    #[cfg(target_os = "macos")]
+    {
+        let tmp_clone = tmp.clone();
+        let dir_clone = dir.clone();
+        let app_path = tokio::task::spawn_blocking(move || install_dmg(&tmp_clone, &dir_clone))
+            .await
+            .map_err(|e| format!("Installer task failed: {e}"))??;
+        let _ = tokio::fs::remove_file(&tmp).await;
+        Ok(app_path.to_string_lossy().into_owned())
+    }
 
-    Ok(dest.to_string_lossy().into_owned())
+    #[cfg(not(target_os = "macos"))]
+    {
+        let dest = dir.join(&asset_name);
+        tokio::fs::rename(&tmp, &dest)
+            .await
+            .map_err(|e| format!("Failed to move {asset_name} into place: {e}"))?;
+
+        #[cfg(target_os = "linux")]
+        {
+            use std::os::unix::fs::PermissionsExt;
+            tokio::fs::set_permissions(&dest, std::fs::Permissions::from_mode(0o755))
+                .await
+                .map_err(|e| format!("Failed to mark {asset_name} executable: {e}"))?;
+        }
+
+        Ok(dest.to_string_lossy().into_owned())
+    }
+}
+
+#[cfg(target_os = "macos")]
+fn install_dmg(
+    dmg: &std::path::Path,
+    install_dir: &std::path::Path,
+) -> Result<std::path::PathBuf, String> {
+    use std::process::Command;
+
+    let mount_dir = std::env::temp_dir().join("ctrlservers-installer-mount");
+    let mount_str = mount_dir.to_string_lossy().into_owned();
+
+    let _ = Command::new("hdiutil")
+        .arg("detach")
+        .arg("-force")
+        .arg(&mount_str)
+        .output();
+    let _ = std::fs::remove_dir_all(&mount_dir);
+    std::fs::create_dir_all(&mount_dir)
+        .map_err(|e| format!("Failed to create the mount folder: {e}"))?;
+
+    let dmg_str = dmg.to_string_lossy().into_owned();
+    let attached = Command::new("hdiutil")
+        .arg("attach")
+        .arg(&dmg_str)
+        .arg("-nobrowse")
+        .arg("-readonly")
+        .arg("-mountpoint")
+        .arg(&mount_str)
+        .output()
+        .map_err(|e| format!("Failed to mount the installer image: {e}"))?;
+    if !attached.status.success() {
+        let _ = Command::new("hdiutil")
+            .arg("detach")
+            .arg("-force")
+            .arg(&mount_str)
+            .output();
+        let _ = std::fs::remove_dir_all(&mount_dir);
+        return Err(format!(
+            "Failed to mount the installer image: {}",
+            String::from_utf8_lossy(&attached.stderr).trim()
+        ));
+    }
+
+    let copied = (|| -> Result<std::path::PathBuf, String> {
+        let entries = std::fs::read_dir(&mount_dir)
+            .map_err(|e| format!("Failed to read the mounted image: {e}"))?;
+        let mut bundle: Option<std::path::PathBuf> = None;
+        for entry in entries {
+            let entry = entry.map_err(|e| format!("Failed to read the mounted image: {e}"))?;
+            let path = entry.path();
+            if path.extension().and_then(|ext| ext.to_str()) == Some("app") {
+                bundle = Some(path);
+                break;
+            }
+        }
+        let bundle = bundle
+            .ok_or_else(|| "The downloaded image does not contain CTRLServers.app".to_string())?;
+        let file_name = bundle
+            .file_name()
+            .ok_or_else(|| "Invalid application bundle name".to_string())?
+            .to_os_string();
+        let dest = install_dir.join(file_name);
+        if dest.exists() {
+            std::fs::remove_dir_all(&dest)
+                .map_err(|e| format!("Failed to remove the existing application: {e}"))?;
+        }
+        let copied = Command::new("cp")
+            .arg("-R")
+            .arg(&bundle)
+            .arg(install_dir)
+            .output()
+            .map_err(|e| format!("Failed to copy CTRLServers: {e}"))?;
+        if !copied.status.success() {
+            return Err(format!(
+                "Failed to copy CTRLServers into the install folder: {}",
+                String::from_utf8_lossy(&copied.stderr).trim()
+            ));
+        }
+        Ok(dest)
+    })();
+
+    let _ = Command::new("hdiutil")
+        .arg("detach")
+        .arg("-force")
+        .arg(&mount_str)
+        .output();
+    let _ = std::fs::remove_dir_all(&mount_dir);
+
+    copied
 }
 
 #[tauri::command]
@@ -417,11 +538,73 @@ fn create_desktop_shortcut(exe_path: String) -> Result<String, String> {
 
         Ok(lnk_str)
     }
-    #[cfg(not(windows))]
+
+    #[cfg(target_os = "macos")]
+    {
+        let target = std::path::Path::new(&exe_path);
+        let desktop = dirs::desktop_dir()
+            .ok_or_else(|| "Could not locate the Desktop folder".to_string())?;
+        let link = desktop.join("CTRLServers.app");
+        match std::fs::symlink_metadata(&link) {
+            Ok(_) => std::fs::remove_file(&link)
+                .map_err(|e| format!("Failed to replace the desktop shortcut: {e}"))?,
+            Err(e) if e.kind() == std::io::ErrorKind::NotFound => {}
+            Err(e) => return Err(format!("Failed to inspect the desktop shortcut: {e}")),
+        }
+        std::os::unix::fs::symlink(target, &link)
+            .map_err(|e| format!("Failed to create the desktop shortcut: {e}"))?;
+        Ok(link.to_string_lossy().into_owned())
+    }
+
+    #[cfg(all(unix, not(target_os = "macos")))]
+    {
+        let exe = std::path::Path::new(&exe_path);
+        let desktop = dirs::desktop_dir()
+            .ok_or_else(|| "Could not locate the Desktop folder".to_string())?;
+        let shortcut = desktop.join("CTRLServers.desktop");
+        let icon = ensure_linux_icon(exe)?;
+        write_desktop_file(&shortcut, exe, &icon)?;
+        Ok(shortcut.to_string_lossy().into_owned())
+    }
+
+    #[cfg(not(any(unix, windows)))]
     {
         let _ = exe_path;
-        Err("Desktop shortcuts are currently only supported on Windows".to_string())
+        Err("Desktop shortcuts are not supported on this platform".to_string())
     }
+}
+
+#[cfg(all(unix, not(target_os = "macos")))]
+fn ensure_linux_icon(exe: &std::path::Path) -> Result<std::path::PathBuf, String> {
+    let dir = exe
+        .parent()
+        .ok_or_else(|| "Could not resolve the install folder".to_string())?;
+    let icon = dir.join("ctrlservers.png");
+    if !icon.exists() {
+        std::fs::write(&icon, include_bytes!("../icons/128x128.png"))
+            .map_err(|e| format!("Failed to write the shortcut icon: {e}"))?;
+    }
+    Ok(icon)
+}
+
+#[cfg(all(unix, not(target_os = "macos")))]
+fn write_desktop_file(
+    path: &std::path::Path,
+    exe: &std::path::Path,
+    icon: &std::path::Path,
+) -> Result<(), String> {
+    use std::os::unix::fs::PermissionsExt;
+
+    let content = format!(
+        "[Desktop Entry]\nType=Application\nName=CTRLServers\nExec=\"{}\"\nIcon={}\nTerminal=false\nCategories=Network;\n",
+        exe.display(),
+        icon.display()
+    );
+    std::fs::write(path, content)
+        .map_err(|e| format!("Failed to write the desktop shortcut: {e}"))?;
+    std::fs::set_permissions(path, std::fs::Permissions::from_mode(0o755))
+        .map_err(|e| format!("Failed to mark the desktop shortcut executable: {e}"))?;
+    Ok(())
 }
 
 #[tauri::command]
@@ -445,20 +628,81 @@ fn set_autostart(enable: bool, exe_path: String) -> Result<(), String> {
         }
         Ok(())
     }
-    #[cfg(not(windows))]
+
+    #[cfg(target_os = "macos")]
+    {
+        let home =
+            dirs::home_dir().ok_or_else(|| "Could not resolve the home folder".to_string())?;
+        let launch_dir = home.join("Library").join("LaunchAgents");
+        std::fs::create_dir_all(&launch_dir)
+            .map_err(|e| format!("Failed to create the launch agents folder: {e}"))?;
+        let plist = launch_dir.join("xyz.ctrlservers.installer.plist");
+        if enable {
+            let content = format!(
+                r#"<?xml version="1.0" encoding="UTF-8"?>
+<!DOCTYPE plist PUBLIC "-//Apple//DTD PLIST 1.0//EN" "http://www.apple.com/DTDs/PropertyList-1.0.dtd">
+<plist version="1.0">
+<dict>
+    <key>Label</key>
+    <string>xyz.ctrlservers.installer</string>
+    <key>ProgramArguments</key>
+    <array>
+        <string>/usr/bin/open</string>
+        <string>-a</string>
+        <string>{exe_path}</string>
+    </array>
+    <key>RunAtLoad</key>
+    <true/>
+</dict>
+</plist>
+"#,
+                exe_path = exe_path
+            );
+            std::fs::write(&plist, content)
+                .map_err(|e| format!("Failed to enable auto-start: {e}"))?;
+            let _ = std::process::Command::new("launchctl")
+                .arg("load")
+                .arg("-w")
+                .arg(&plist)
+                .output();
+        } else {
+            let _ = std::process::Command::new("launchctl")
+                .arg("unload")
+                .arg("-w")
+                .arg(&plist)
+                .output();
+            let _ = std::fs::remove_file(&plist);
+        }
+        Ok(())
+    }
+
+    #[cfg(all(unix, not(target_os = "macos")))]
+    {
+        let config = dirs::config_dir()
+            .ok_or_else(|| "Could not resolve the config folder".to_string())?;
+        let autostart = config.join("autostart");
+        std::fs::create_dir_all(&autostart)
+            .map_err(|e| format!("Failed to create the autostart folder: {e}"))?;
+        let entry = autostart.join("CTRLServers.desktop");
+        if enable {
+            let exe = std::path::Path::new(&exe_path);
+            let icon = ensure_linux_icon(exe)?;
+            write_desktop_file(&entry, exe, &icon)?;
+        } else {
+            let _ = std::fs::remove_file(&entry);
+        }
+        Ok(())
+    }
+
+    #[cfg(not(any(unix, windows)))]
     {
         let _ = (enable, exe_path);
-        Err("Auto-start is currently only supported on Windows".to_string())
+        Err("Auto-start is not supported on this platform".to_string())
     }
 }
 
 #[tauri::command]
 fn launch_app(exe_path: String) -> Result<(), String> {
-    let dir = std::path::Path::new(&exe_path)
-        .parent()
-        .map(|p| p.to_path_buf())
-        .unwrap_or_default();
-
     #[cfg(windows)]
     {
         use std::os::windows::process::CommandExt;
@@ -466,31 +710,82 @@ fn launch_app(exe_path: String) -> Result<(), String> {
         const DETACHED_PROCESS: u32 = 0x0000_0008;
         const CREATE_NEW_PROCESS_GROUP: u32 = 0x0000_0200;
 
+        let dir = std::path::Path::new(&exe_path)
+            .parent()
+            .map(|p| p.to_path_buf())
+            .unwrap_or_default();
+
         std::process::Command::new(&exe_path)
             .current_dir(&dir)
             .creation_flags(DETACHED_PROCESS | CREATE_NEW_PROCESS_GROUP)
             .spawn()
             .map_err(|e| format!("Failed to launch CTRLServers: {e}"))?;
+        Ok(())
     }
 
-    #[cfg(not(windows))]
+    #[cfg(target_os = "macos")]
     {
+        std::process::Command::new("open")
+            .arg(&exe_path)
+            .spawn()
+            .map_err(|e| format!("Failed to launch CTRLServers: {e}"))?;
+        Ok(())
+    }
+
+    #[cfg(not(any(windows, target_os = "macos")))]
+    {
+        let dir = std::path::Path::new(&exe_path)
+            .parent()
+            .map(|p| p.to_path_buf())
+            .unwrap_or_default();
+
         std::process::Command::new(&exe_path)
             .current_dir(&dir)
             .spawn()
             .map_err(|e| format!("Failed to launch CTRLServers: {e}"))?;
+        Ok(())
     }
-
-    Ok(())
 }
 
 #[tauri::command]
 fn open_install_folder(exe_path: String) -> Result<(), String> {
-    std::process::Command::new("explorer.exe")
-        .arg(format!("/select,{}", exe_path))
-        .spawn()
-        .map_err(|e| format!("Failed to open the install folder: {e}"))?;
-    Ok(())
+    #[cfg(windows)]
+    {
+        std::process::Command::new("explorer.exe")
+            .arg(format!("/select,{}", exe_path))
+            .spawn()
+            .map_err(|e| format!("Failed to open the install folder: {e}"))?;
+        Ok(())
+    }
+
+    #[cfg(target_os = "macos")]
+    {
+        std::process::Command::new("open")
+            .arg("-R")
+            .arg(&exe_path)
+            .spawn()
+            .map_err(|e| format!("Failed to open the install folder: {e}"))?;
+        Ok(())
+    }
+
+    #[cfg(all(unix, not(target_os = "macos")))]
+    {
+        let dir = std::path::Path::new(&exe_path)
+            .parent()
+            .map(|p| p.to_string_lossy().into_owned())
+            .ok_or_else(|| "Could not resolve the install folder".to_string())?;
+        std::process::Command::new("xdg-open")
+            .arg(dir)
+            .spawn()
+            .map_err(|e| format!("Failed to open the install folder: {e}"))?;
+        Ok(())
+    }
+
+    #[cfg(not(any(unix, windows)))]
+    {
+        let _ = exe_path;
+        Err("Opening the install folder is not supported on this platform".to_string())
+    }
 }
 
 #[tauri::command]
