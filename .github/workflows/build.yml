@@ -26,10 +26,11 @@ jobs:
           workspaces: src-tauri
       - run: npm ci
       - run: npm run build:win
+      - run: Move-Item src-tauri/target/release/ctrlservers-installer.exe src-tauri/target/release/CTRLServers-Installer_x64.exe
       - uses: softprops/action-gh-release@v2
         with:
           files: |
-            src-tauri/target/**/bundle/nsis/*.exe
+            src-tauri/target/release/CTRLServers-Installer_x64.exe
   linux:
     needs: release
     runs-on: ubuntu-latest
